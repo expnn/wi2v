@@ -178,28 +178,16 @@ def _resolve_project(
     return None
 
 
-def cmd_convert(args):
-    entity = args.entity
-    project = args.project  # 可能为 None
-    run_id = args.run_id
-    image_key = args.image_key
-
+def _do_convert(
+    entity: str,
+    project: str,
+    run_id: str,
+    image_key: str,
+    output: str,
+    fps: int,
+) -> None:
+    """核心转换逻辑：下载图像并合成视频。所有参数须已解析完毕。"""
     api = wandb.Api()
-    if entity is None:
-        entity = api.default_entity
-        print(f"自动获取 Entity: {entity}")
-
-    # 解析 project
-    project = _resolve_project(api, entity, run_id, explicit_project=project)
-    if project is None:
-        print(f"错误: 未找到 Run {run_id} 所属的 Project，请用 -p 显式指定。")
-        return
-
-    # 记住本次使用的 project
-    config = _load_config()
-    config["last_project"] = project
-    _save_config(config)
-
     run = api.run(f"{entity}/{project}/{run_id}")
 
     print(f"正在从 Run {run_id} 中提取图像信息...")
@@ -227,7 +215,7 @@ def cmd_convert(args):
         if entry:
             filepath = os.path.join(work_dir, entry["file"])
             if os.path.exists(filepath) and _sha256_file(filepath) == entry["sha256"]:
-                continue  # 缓存有效，跳过
+                continue
         to_download.append((step, row))
 
     print(
@@ -256,7 +244,6 @@ def cmd_convert(args):
                 "file": local_name,
                 "sha256": sha,
             }
-            # 记录扫描到的总帧数（下次 list 时参考，可能过时）
             manifest["total_frames"] = total_frames
             _save_json(manifest_path, manifest)
         except wandb.errors.CommError as e:
@@ -294,13 +281,11 @@ def cmd_convert(args):
         return
 
     # 合成视频
-    output_video = args.output
-    fps = args.fps
-    print(f"正在合成视频: {output_video}（共 {len(image_paths)} 帧）...")
+    print(f"正在合成视频: {output}（共 {len(image_paths)} 帧）...")
     first_img = cv2.imread(image_paths[0])
     h, w = first_img.shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video = cv2.VideoWriter(output_video, fourcc, fps, (w, h))
+    video = cv2.VideoWriter(output, fourcc, fps, (w, h))
     for path in image_paths:
         img = cv2.imread(path)
         if img is not None:
@@ -310,6 +295,29 @@ def cmd_convert(args):
     video.release()
     cv2.destroyAllWindows()
     print("完成！")
+
+
+def cmd_convert(args):
+    entity = args.entity
+    project = args.project
+    run_id = args.run_id
+    image_key = args.image_key
+
+    api = wandb.Api()
+    if entity is None:
+        entity = api.default_entity
+        print(f"自动获取 Entity: {entity}")
+
+    project = _resolve_project(api, entity, run_id, explicit_project=project)
+    if project is None:
+        print(f"错误: 未找到 Run {run_id} 所属的 Project，请用 -p 显式指定。")
+        return
+
+    config = _load_config()
+    config["last_project"] = project
+    _save_config(config)
+
+    _do_convert(entity, project, run_id, image_key, args.output, args.fps)
 
 
 # ---- list 子命令 ----
@@ -409,6 +417,33 @@ def cmd_clean(args):
         _save_index(index)
 
 
+# ---- redo 子命令 ----
+
+
+def cmd_redo(args):
+    """根据 task_id 重新执行转换。"""
+    task_id = args.task_id
+    result = _find_task_by_id(task_id)
+    if result is None:
+        print(f"未找到 ID 为 {task_id} 的任务。使用 list 命令查看所有任务。")
+        return
+
+    slug, info = result
+    entity = info["entity"]
+    project = info["project"]
+    run_id = info["run_id"]
+    image_key = info["image_key"]
+
+    print(f"重新执行任务 #{task_id}: {slug}")
+
+    # 更新 last_project
+    config = _load_config()
+    config["last_project"] = project
+    _save_config(config)
+
+    _do_convert(entity, project, run_id, image_key, args.output, args.fps)
+
+
 # ---- 主入口 ----
 
 
@@ -449,8 +484,19 @@ def main():
     p_clean.add_argument("--all", "-a", action="store_true", help="清空所有任务的缓存")
     p_clean.set_defaults(func=cmd_clean)
 
+    # redo
+    p_redo = sub.add_parser("redo", help="重新执行指定任务的转换")
+    p_redo.add_argument(
+        "--task-id", "-t", type=int, required=True, help="任务 ID"
+    )
+    p_redo.add_argument(
+        "--output", "-o", default="experiment_timelapse.mp4", help="输出视频文件名"
+    )
+    p_redo.add_argument("--fps", type=int, default=10, help="视频帧率（默认：10）")
+    p_redo.set_defaults(func=cmd_redo)
+
     # 无子命令时默认执行 convert（向后兼容）
-    KNOWN_COMMANDS = {"convert", "c", "list", "ls", "clean", "rm", "-h", "--help"}
+    KNOWN_COMMANDS = {"convert", "c", "list", "ls", "clean", "rm", "redo", "-h", "--help"}
     if len(sys.argv) == 1 or (len(sys.argv) >= 2 and sys.argv[1] not in KNOWN_COMMANDS):
         sys.argv.insert(1, "convert")
 
