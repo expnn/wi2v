@@ -5,9 +5,15 @@
 支持断点续传、SHA256 完整性校验、多任务缓存管理。
 
 ## 安装
+本项目依赖 ffmpeg，请确保 ffmpeg 已正确安装并添加到系统 PATH 环境变量中。
 
 ```bash
 # 推荐：使用 uv
+uv tool install https://github.com/expnn/wi2v.git
+
+# 或者
+git clone https://github.com/expnn/wi2v.git
+cd wi2v
 uv pip install -e .
 
 # 或使用 pip

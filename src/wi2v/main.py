@@ -4,17 +4,30 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 
-import cv2
+import ffmpeg
+import numpy as np
 import wandb
 import wandb.errors
+from PIL import Image
 from tqdm import tqdm
 
 CACHE_ROOT = os.path.expanduser("~/.cache/wi2v")
 
 
 # ---- 工具函数 ----
+
+
+def _validate_image(path: str) -> bool:
+    """验证图像文件是否完整可读。"""
+    try:
+        with Image.open(path) as img:
+            img.convert('RGB')
+        return True
+    except Exception:
+        return False
 
 
 def _sha256_file(path: str) -> str:
@@ -215,7 +228,11 @@ def _do_convert(
         if entry:
             filepath = os.path.join(work_dir, entry["file"])
             if os.path.exists(filepath) and _sha256_file(filepath) == entry["sha256"]:
-                continue
+                if _validate_image(filepath):
+                    continue
+                # 缓存的图像损坏，删除并重新下载
+                os.remove(filepath)
+                del manifest["images"][step]
         to_download.append((step, row))
 
     print(
@@ -238,6 +255,11 @@ def _do_convert(
                 if os.path.exists(local_path):
                     os.remove(local_path)
                 os.rename(downloaded_path, local_path)
+
+            if not _validate_image(local_path):
+                tqdm.write(f"下载文件损坏 step {step}，已删除")
+                os.remove(local_path)
+                continue
 
             sha = _sha256_file(local_path)
             manifest.setdefault("images", {})[step] = {
@@ -282,18 +304,54 @@ def _do_convert(
 
     # 合成视频
     print(f"正在合成视频: {output}（共 {len(image_paths)} 帧）...")
-    first_img = cv2.imread(image_paths[0])
+
+    if not shutil.which("ffmpeg"):
+        print("错误: 未找到 ffmpeg，请先安装: brew install ffmpeg")
+        return
+
+    try:
+        first_img = np.array(Image.open(image_paths[0]).convert('RGB'))
+    except Exception as e:
+        print(f"错误: 无法读取首帧 {image_paths[0]}: {e}")
+        return
     h, w = first_img.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video = cv2.VideoWriter(output, fourcc, fps, (w, h))
-    for path in image_paths:
-        img = cv2.imread(path)
-        if img is not None:
-            video.write(img)
-        else:
-            print(f"警告: 无法读取 {path}，跳过")
-    video.release()
-    cv2.destroyAllWindows()
+
+    process = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{w}x{h}', framerate=fps)
+        .output(output, vcodec='libx264', pix_fmt='yuv420p', crf=23, movflags='+faststart')
+        .overwrite_output()
+        .run_async(pipe_stdin=True, pipe_stderr=True)
+    )
+
+    def _read_stderr():
+        for line in process.stderr:
+            tqdm.write(line.decode().rstrip())
+
+    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+    stderr_thread.start()
+
+    try:
+        for path in image_paths:
+            try:
+                img = np.array(Image.open(path).convert('RGB'))
+                if img.shape[:2] != (h, w):
+                    print(f"警告: {path} 尺寸异常 {img.shape[:2]}，期望 ({h},{w})，使用黑色帧代替")
+                    img = np.zeros((h, w, 3), dtype=np.uint8)
+                    os.remove(path)
+            except Exception as e:
+                print(f"警告: 无法读取 {path}，使用黑色帧代替。\n{e}")
+                img = np.zeros((h, w, 3), dtype=np.uint8)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            process.stdin.write(img.tobytes())
+    finally:
+        process.stdin.close()
+        process.wait()
+        stderr_thread.join(timeout=5)
+
     print("完成！")
 
 
